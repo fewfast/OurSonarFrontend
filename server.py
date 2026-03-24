@@ -34,8 +34,10 @@ mqtt_client.loop_start()
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    print("Webhook received!")  
     signature = request.headers["X-Line-Signature"]
     body = request.get_data(as_text=True)
+    print(f"Body: {body}")
     handler.handle(body, signature)
     return "OK"
 
@@ -59,7 +61,3 @@ def handle_message(event):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
-LINE_TOKEN = os.environ.get("LINE_TOKEN")
-LINE_SECRET = os.environ.get("LINE_SECRET")
-USER_ID = os.environ.get("USER_ID")
