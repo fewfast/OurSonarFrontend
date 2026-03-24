@@ -65,29 +65,54 @@ def handle_message(event):
     print(f"💬 Message: {text}", flush=True)
     reply_text = None
 
-    if text == "เปิด Servo":
-        mqtt_client.publish("BeanNian/esp32/servo", "ON")
-        reply_text = "✅ เปิด Servo แล้ว"
-    elif text == "ปิด Servo":
-        mqtt_client.publish("BeanNian/esp32/servo", "OFF")
-        reply_text = "✅ ปิด Servo แล้ว"
+    if text == "เปิด System":
+        mqtt_client.publish("BeanNian/esp32/config", "system:ON")
+        reply_text = "✅ เปิด System แล้ว"
+    elif text == "ปิด System":
+        mqtt_client.publish("BeanNian/esp32/config", "system:OFF")
+        reply_text = "✅ ปิด System แล้ว"
     elif text == "เปิด Alert":
-        mqtt_client.publish("BeanNian/esp32/alert", "ON")
+        mqtt_client.publish("BeanNian/esp32/config", "alert:ON")
         reply_text = "🔔 เปิด Alert แล้ว"
     elif text == "ปิด Alert":
-        mqtt_client.publish("BeanNian/esp32/alert", "OFF")
+        mqtt_client.publish("BeanNian/esp32/config", "alert:OFF")
         reply_text = "🔕 ปิด Alert แล้ว"
     elif text == "ROAM":
-        mqtt_client.publish("BeanNian/esp32/sonar", "ROAM")
+        mqtt_client.publish("BeanNian/esp32/config", "mode:ROAM")
         reply_text = "🤖 โหมด ROAM"
     elif text == "TRACK":
-        mqtt_client.publish("BeanNian/esp32/sonar", "TRACK")
+        mqtt_client.publish("BeanNian/esp32/config", "mode:TRACK")
         reply_text = "🎯 โหมด TRACK"
     elif text == "STATIC":
-        mqtt_client.publish("BeanNian/esp32/sonar", "STATIC")
+        mqtt_client.publish("BeanNian/esp32/config", "mode:STATIC")
         reply_text = "🛑 โหมด STATIC"
+    elif text.startswith("angle:"):
+        # format: angle:0-180
+        parts = text.split(":")[1].split("-")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            minVal, maxVal = int(parts[0]), int(parts[1])
+            if 0 <= minVal < maxVal <= 180:
+                mqtt_client.publish("BeanNian/esp32/config", text)
+                reply_text = f"📐 กวาด {minVal}°-{maxVal}° (ROAM/TRACK)"
+            else:
+                reply_text = "❌ range ต้องอยู่ใน 0-180 และ min < max"
+        else:
+            reply_text = "❌ format ผิด ใช้ angle:45-135"
+    elif text.startswith("pos:"):
+        # format: pos:90
+        parts = text.split(":")
+        if len(parts) == 2 and parts[1].isdigit():
+            deg = int(parts[1])
+            if 0 <= deg <= 180:
+                mqtt_client.publish("BeanNian/esp32/config", text)
+                reply_text = f"📍 STATIC หมุนไปที่ {deg}°"
+            else:
+                reply_text = "❌ มุมต้องอยู่ใน 0-180"
+        else:
+            reply_text = "❌ format ผิด ใช้ pos:90"
     else:
         reply_text = f"❓ ไม่รู้จำคำสั่ง: {text}"
+    
 
     if reply_text:
         print(f"↩️ Reply: {reply_text}", flush=True)
