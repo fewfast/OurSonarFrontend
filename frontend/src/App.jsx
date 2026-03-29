@@ -20,13 +20,24 @@ function App() {
     degreeLimit: { min: 0, max: 180 },
     staticLimit: { min: 45, max: 135 },
     currentStaticAngle: 90,
-    maxDetectCm: 100,   // ← ใหม่
-    redZoneCm:   30,    // ← ใหม่
+    maxDetectCm: 100,
+    redZoneCm:   30,
   });
 
   const [currentAngle, setCurrentAngle] = useState(90);
   const [alertLogs, setAlertLogs] = useState([]);
+  const [alertFilter, setAlertFilter] = useState('all'); // 'all' | 'notice' | 'redzone'
   const [systemLogs, setSystemLogs] = useState([]);
+  const [esp32Status, setEsp32Status] = useState('OFFLINE');
+
+  // ── Validation error messages ──
+  const [errors, setErrors] = useState({
+    degreeMin: '',
+    degreeMax: '',
+    redZone: '',
+    maxDetect: '',
+  });
+
   const canvasRef = useRef(null);
 
   // ─────────────────────────────────────────
@@ -40,7 +51,6 @@ function App() {
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
 
-    // วาด Arc Grid
     [0.25, 0.5, 0.75, 1].forEach((scale) => {
       ctx.beginPath();
       ctx.arc(CX, CY, RADAR_R * scale, Math.PI, 2 * Math.PI);
@@ -49,7 +59,6 @@ function App() {
       ctx.stroke();
     });
 
-    // วาดเส้น degree แบ่ง 30°
     for (let deg = 0; deg <= 180; deg += 30) {
       const rad = (deg * Math.PI) / 180;
       ctx.beginPath();
@@ -59,7 +68,6 @@ function App() {
       ctx.lineWidth = 0.5;
       ctx.stroke();
 
-      // Label degree
       const lx = CX + (RADAR_R + 12) * Math.cos(Math.PI - rad);
       const ly = CY - (RADAR_R + 12) * Math.sin(rad);
       ctx.fillStyle = '#005500';
@@ -70,19 +78,16 @@ function App() {
   }, []);
 
   // ─────────────────────────────────────────
-  //  วาด Radar Sweep (รับ data จาก Socket)
-  //  ── ใหม่: dot สีแดงเข้ม = red zone, แดงปกติ = detect ──
+  //  วาด Radar Sweep
   // ─────────────────────────────────────────
   const drawRadar = useCallback((data, cfg) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
 
-    // Trail fade effect
     ctx.fillStyle = 'rgba(0, 0, 0, 0.08)';
     ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
 
-    // วาด Arc Grid (วาดซ้ำเพื่อไม่ให้หายตาม fade)
     [0.25, 0.5, 0.75, 1].forEach((scale) => {
       ctx.beginPath();
       ctx.arc(CX, CY, RADAR_R * scale, Math.PI, 2 * Math.PI);
@@ -91,7 +96,6 @@ function App() {
       ctx.stroke();
     });
 
-    // ── ใหม่: วาด Red Zone arc ──
     if (cfg && cfg.maxDetectCm > 0) {
       const redRatio = Math.min(cfg.redZoneCm / cfg.maxDetectCm, 1);
       ctx.beginPath();
@@ -107,7 +111,6 @@ function App() {
     const ex = CX + RADAR_R * Math.cos(Math.PI - rad);
     const ey = CY - RADAR_R * Math.sin(rad);
 
-    // Sweep Line (สีเขียวสว่าง)
     ctx.beginPath();
     ctx.moveTo(CX, CY);
     ctx.lineTo(ex, ey);
@@ -118,14 +121,12 @@ function App() {
     ctx.stroke();
     ctx.shadowBlur = 0;
 
-    // จุดวัตถุที่ตรวจพบ
     if (data.hasObject && data.distance > 0 && cfg && cfg.maxDetectCm > 0) {
       const ratio = Math.min(data.distance / cfg.maxDetectCm, 1);
       const dotR = ratio * RADAR_R;
       const dx = CX + dotR * Math.cos(Math.PI - rad);
       const dy = CY - dotR * Math.sin(rad);
 
-      // สีต่างกันถ้าอยู่ใน red zone
       const isRed = data.inRedZone;
       ctx.beginPath();
       ctx.arc(dx, dy, isRed ? 8 : 6, 0, 2 * Math.PI);
@@ -140,7 +141,6 @@ function App() {
   // ─────────────────────────────────────────
   //  Socket.IO Events
   // ─────────────────────────────────────────
-  // เก็บ config ref เพื่อใช้ใน drawRadar โดยไม่ต้อง re-subscribe socket
   const configRef = useRef(config);
   useEffect(() => { configRef.current = config; }, [config]);
 
@@ -154,7 +154,8 @@ function App() {
 
     socket.on('new_log', (log) => {
       if (log.type === 'ALERT') {
-        setAlertLogs((prev) => [log, ...prev].slice(0, 20));
+        const enriched = { ...log, zone: log.zone ?? (log.inRedZone ? 'redzone' : 'notice') };
+        setAlertLogs((prev) => [enriched, ...prev].slice(0, 20));
       } else {
         setSystemLogs((prev) => [log, ...prev].slice(0, 10));
       }
@@ -165,18 +166,15 @@ function App() {
       drawRadar(data, configRef.current);
     });
 
+    socket.on('esp32_status', (status) => {
+      setEsp32Status(status);
+    });
+
     return () => socket.off();
   }, [drawRadar]);
 
-  // วาด Empty Grid ตอน Mount
-  useEffect(() => {
-    drawEmptyRadar();
-  }, [drawEmptyRadar]);
-
-  // Clear Canvas เมื่อ Mode เปลี่ยน
-  useEffect(() => {
-    drawEmptyRadar();
-  }, [config.mode, drawEmptyRadar]);
+  useEffect(() => { drawEmptyRadar(); }, [drawEmptyRadar]);
+  useEffect(() => { drawEmptyRadar(); }, [config.mode, drawEmptyRadar]);
 
   // ─────────────────────────────────────────
   //  Helpers
@@ -193,20 +191,73 @@ function App() {
   const clamp = (val, min = 0, max = 180) => Math.max(min, Math.min(max, Number(val)));
 
   // ─────────────────────────────────────────
+  //  Validated change handlers
+  // ─────────────────────────────────────────
+  const handleDegreeMin = (raw) => {
+    const val = clamp(raw);
+    if (val >= config.degreeLimit.max) {
+      setErrors((e) => ({ ...e, degreeMin: `Min ต้องน้อยกว่า Max (${config.degreeLimit.max}°)` }));
+    } else {
+      setErrors((e) => ({ ...e, degreeMin: '', degreeMax: '' }));
+      updateConfig({ degreeLimit: { ...config.degreeLimit, min: val } });
+    }
+  };
+
+  const handleDegreeMax = (raw) => {
+    const val = clamp(raw);
+    if (val <= config.degreeLimit.min) {
+      setErrors((e) => ({ ...e, degreeMax: `Max ต้องมากกว่า Min (${config.degreeLimit.min}°)` }));
+    } else {
+      setErrors((e) => ({ ...e, degreeMax: '', degreeMin: '' }));
+      updateConfig({ degreeLimit: { ...config.degreeLimit, max: val } });
+    }
+  };
+
+  const handleMaxDetect = (raw) => {
+    const val = clamp(raw, 1, 500);
+    if (config.redZoneCm > val) {
+      setErrors((e) => ({ ...e, maxDetect: `Max Detect ต้องไม่น้อยกว่า Red Zone (${config.redZoneCm} cm)` }));
+    } else {
+      setErrors((e) => ({ ...e, maxDetect: '', redZone: '' }));
+      updateConfig({ maxDetectCm: val });
+    }
+  };
+
+  const handleRedZone = (raw) => {
+    const val = clamp(raw, 1, 500);
+    // เท่ากับ max detect ได้ แต่ห้ามเกิน
+    if (val > config.maxDetectCm) {
+      setErrors((e) => ({ ...e, redZone: `Red Zone ต้องไม่เกิน Max Detect (${config.maxDetectCm} cm)` }));
+    } else {
+      setErrors((e) => ({ ...e, redZone: '', maxDetect: '' }));
+      updateConfig({ redZoneCm: val });
+    }
+  };
+
+  // ─────────────────────────────────────────
+  //  Filtered logs
+  // ─────────────────────────────────────────
+  const filteredAlertLogs = alertFilter === 'all'
+    ? alertLogs
+    : alertLogs.filter((l) => l.zone === alertFilter);
+
+  // ─────────────────────────────────────────
   //  Styles
   // ─────────────────────────────────────────
   const s = {
-    page:    { padding: '20px', background: '#050505', color: '#0f0', minHeight: '100vh', fontFamily: 'monospace' },
-    grid:    { display: 'grid', gridTemplateColumns: '380px 1fr', gap: '25px' },
-    col:     { display: 'flex', flexDirection: 'column', gap: '20px' },
-    panel:   { border: '1px solid #0f0', padding: '15px', borderRadius: '8px', background: '#0a0a0a' },
-    input:   { width: '60px', background: '#000', color: '#0f0', border: '1px solid #0f0', padding: '5px' },
-    inputRed:{ width: '60px', background: '#000', color: '#ff4444', border: '1px solid #ff4444', padding: '5px' },
+    page:     { padding: '20px', background: '#050505', color: '#0f0', minHeight: '100vh', fontFamily: 'monospace' },
+    grid:     { display: 'grid', gridTemplateColumns: '380px 1fr', gap: '25px' },
+    col:      { display: 'flex', flexDirection: 'column', gap: '20px' },
+    panel:    { border: '1px solid #0f0', padding: '15px', borderRadius: '8px', background: '#0a0a0a' },
+    input:    { width: '60px', background: '#000', color: '#0f0', border: '1px solid #0f0', padding: '5px' },
+    inputRed: { width: '60px', background: '#000', color: '#ff4444', border: '1px solid #ff4444', padding: '5px' },
+    inputErr: { width: '60px', background: '#1a0000', color: '#ff4444', border: '2px solid #ff4444', padding: '5px' },
+    errMsg:   { color: '#ff4444', fontSize: '10px', marginTop: '4px', display: 'flex', alignItems: 'center', gap: '4px' },
     btnPrim: (active) => ({
       flex: 1, padding: '12px', cursor: 'pointer',
       background: active ? '#ff4444' : '#008800', color: '#fff', border: 'none', fontWeight: 'bold',
     }),
-    btnSec:  (active) => ({
+    btnSec: (active) => ({
       flex: 1, padding: '12px', cursor: 'pointer',
       background: active ? '#0f0' : '#222', color: active ? '#000' : '#0f0', border: '1px solid #0f0',
     }),
@@ -218,10 +269,19 @@ function App() {
     btnArrow: { padding: '10px 20px', fontSize: '20px', background: '#111', color: '#0f0', border: '1px solid #0f0', cursor: 'pointer' },
   };
 
-  // คำนวณ % red zone สำหรับ visual bar
   const redPct = config.maxDetectCm > 0
     ? Math.min((config.redZoneCm / config.maxDetectCm) * 100, 100).toFixed(0)
     : 0;
+
+  const filterTabs = [
+    { key: 'all',     label: 'ALL',      color: '#ff4444', activeBg: '#3a0000' },
+    { key: 'notice',  label: 'NOTICE',   color: '#ff8800', activeBg: '#1a0e00' },
+    { key: 'redzone', label: 'RED ZONE', color: '#cc2222', activeBg: '#0d0000' },
+  ];
+
+  // inline error component
+  const ErrMsg = ({ msg }) =>
+    msg ? <div style={s.errMsg}>⚠ {msg}</div> : null;
 
   return (
     <div style={s.page}>
@@ -279,88 +339,63 @@ function App() {
             {/* Roam/Track: Detection Limit */}
             {(config.mode === 'Roam' || config.mode === 'Track') && (
               <>
-                <h4 style={{ margin: '0 0 8px 0' }}>DETECTION LIMIT (SCAN RANGE)</h4>
-                <div style={{ display: 'flex', gap: '10px', marginBottom: '15px' }}>
+                <h4 style={{ margin: '0 0 8px 0' }}>Rotation LIMIT (SCAN RANGE 0–180°)</h4>
+                <div style={{ display: 'flex', gap: '20px', marginBottom: '4px' }}>
                   <div>
-                    Min:{' '}
+                    <div style={{ marginBottom: '4px', fontSize: '12px' }}>Min:</div>
                     <input
                       type="number" min="0" max="180"
-                      value={config.degreeLimit.min}
-                      onChange={(e) =>
-                        updateConfig({ degreeLimit: { ...config.degreeLimit, min: clamp(e.target.value) } })
-                      }
-                      style={s.input}
+                      defaultValue={config.degreeLimit.min}
+                      onBlur={(e) => handleDegreeMin(e.target.value)}
+                      style={errors.degreeMin ? s.inputErr : s.input}
                     />
                   </div>
                   <div>
-                    Max:{' '}
+                    <div style={{ marginBottom: '4px', fontSize: '12px' }}>Max:</div>
                     <input
                       type="number" min="0" max="180"
-                      value={config.degreeLimit.max}
-                      onChange={(e) =>
-                        updateConfig({ degreeLimit: { ...config.degreeLimit, max: clamp(e.target.value) } })
-                      }
-                      style={s.input}
+                      defaultValue={config.degreeLimit.max}
+                      onBlur={(e) => handleDegreeMax(e.target.value)}
+                      style={errors.degreeMax ? s.inputErr : s.input}
                     />
                   </div>
                 </div>
+                {errors.degreeMin && <ErrMsg msg={errors.degreeMin} />}
+                {errors.degreeMax && <ErrMsg msg={errors.degreeMax} />}
+                <div style={{ marginBottom: '15px' }} />
               </>
             )}
 
-            {/* Static Limit */}
-            <h4 style={{ margin: '0 0 8px 0' }}>STATIC LIMIT (FIXED AREA)</h4>
-            <div style={{ display: 'flex', gap: '10px', marginBottom: '15px' }}>
-              <div>
-                Min:{' '}
-                <input
-                  type="number" min="0" max="180"
-                  value={config.staticLimit.min}
-                  onChange={(e) =>
-                    updateConfig({ staticLimit: { ...config.staticLimit, min: clamp(e.target.value) } })
-                  }
-                  style={s.input}
-                />
-              </div>
-              <div>
-                Max:{' '}
-                <input
-                  type="number" min="0" max="180"
-                  value={config.staticLimit.max}
-                  onChange={(e) =>
-                    updateConfig({ staticLimit: { ...config.staticLimit, max: clamp(e.target.value) } })
-                  }
-                  style={s.input}
-                />
-              </div>
-            </div>
-
-            {/* ── ใหม่: Max Detect ── */}
+            {/* Max Detect */}
             <h4 style={{ margin: '0 0 8px 0' }}>MAX DETECT (RANGE)</h4>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '15px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '4px' }}>
               <input
                 type="number" min="1" max="500"
-                value={config.maxDetectCm}
-                onChange={(e) => updateConfig({ maxDetectCm: clamp(e.target.value, 1, 500) })}
-                style={{ ...s.input, width: '70px' }}
+                defaultValue={config.maxDetectCm}
+                onBlur={(e) => handleMaxDetect(e.target.value)}
+                style={errors.maxDetect ? { ...s.inputErr, width: '70px' } : { ...s.input, width: '70px' }}
               />
               <span style={{ fontSize: '12px', color: '#555' }}>cm &nbsp;(1 – 500 cm)</span>
             </div>
+            {errors.maxDetect && <ErrMsg msg={errors.maxDetect} />}
+            <div style={{ marginBottom: '15px' }} />
 
-            {/* ── ใหม่: Red Zone ── */}
+            {/* Red Zone */}
             <h4 style={{ margin: '0 0 8px 0', color: '#ff4444' }}>⚠ RED ZONE (ALERT THRESHOLD)</h4>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '4px' }}>
               <input
-                type="number" min="1" max="499"
-                value={config.redZoneCm}
-                onChange={(e) => updateConfig({ redZoneCm: clamp(e.target.value, 1, 499) })}
-                style={s.inputRed}
+                type="number" min="1" max="500"
+                defaultValue={config.redZoneCm}
+                onBlur={(e) => handleRedZone(e.target.value)}
+                style={errors.redZone ? s.inputErr : s.inputRed}
               />
-              <span style={{ fontSize: '12px', color: '#883333' }}>cm &nbsp;(ต้องน้อยกว่า Max Detect)</span>
+              <span style={{ fontSize: '12px', color: '#883333' }}>cm &nbsp;(≤ Max Detect)</span>
             </div>
+            {errors.redZone && <ErrMsg msg={errors.redZone} />}
+            <div style={{ marginBottom: '10px' }} />
 
             {/* Visual range bar */}
             <div style={{ position: 'relative', height: '18px', background: '#001a00', borderRadius: '4px', overflow: 'hidden', border: '1px solid #003300' }}>
-              {/* Red zone fill */}
               <div style={{
                 position: 'absolute', left: 0, top: 0, height: '100%',
                 width: `${redPct}%`,
@@ -382,9 +417,7 @@ function App() {
           <div style={{ border: '1px solid #008800', borderRadius: '8px', padding: '10px', background: '#051005' }}>
             <h5 style={{ margin: '0 0 10px 0', color: '#00ff00' }}>📟 SYSTEM LOGS</h5>
             <div style={{ height: '150px', overflowY: 'auto', fontSize: '11px' }}>
-              {systemLogs.length === 0 && (
-                <p style={{ color: '#333', margin: 0 }}>No system events...</p>
-              )}
+              {systemLogs.length === 0 && <p style={{ color: '#333', margin: 0 }}>No system events...</p>}
               {systemLogs.map((l, i) => (
                 <div key={i} style={{ borderBottom: '1px solid #003300', padding: '3px 0' }}>
                   <span style={{ color: '#005500' }}>[{l.time}]</span> {l.msg}
@@ -407,30 +440,86 @@ function App() {
               <span>ANGLE: <b style={{ color: '#0ff' }}>{currentAngle}°</b></span>
               <span>MAX: <b style={{ color: '#0f0' }}>{config.maxDetectCm}cm</b></span>
               <span>RED: <b style={{ color: '#f44' }}>{config.redZoneCm}cm</b></span>
+              <span>
+                ESP32:{' '}
+                <b style={{ color: esp32Status === 'ONLINE' ? '#0f0' : '#f00' }}>
+                  {esp32Status === 'ONLINE' ? '🟢 ONLINE' : '🔴 OFFLINE'}
+                </b>
+              </span>
             </div>
           </div>
 
           {/* Alert Logs */}
           <div style={{ border: '1px solid #ff0000', borderRadius: '8px', padding: '15px', background: '#100000' }}>
-            <h4 style={{ margin: '0 0 10px 0', color: '#ff4444' }}>
-              🚨 ALERT DETECTION LOGS (REAL-TIME)
+
+            {/* Header row */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px', flexWrap: 'wrap', gap: '8px' }}>
+              <h4 style={{ margin: 0, color: '#ff4444' }}>🚨 ALERT DETECTION LOGS (REAL-TIME)</h4>
               {alertLogs.length > 0 && (
                 <button
                   onClick={() => setAlertLogs([])}
-                  style={{ marginLeft: '10px', padding: '2px 8px', background: 'transparent', color: '#ff4444', border: '1px solid #ff4444', cursor: 'pointer', fontSize: '11px' }}
+                  style={{ padding: '2px 8px', background: 'transparent', color: '#ff4444', border: '1px solid #ff4444', cursor: 'pointer', fontSize: '11px', fontFamily: 'monospace' }}
                 >
                   CLEAR
                 </button>
               )}
-            </h4>
-            <div style={{ height: '250px', overflowY: 'auto', fontSize: '14px' }}>
-              {alertLogs.map((l, i) => (
-                <div key={i} style={{ color: '#ff4444', borderBottom: '1px solid #440000', padding: '8px 0', fontWeight: 'bold' }}>
-                  <span style={{ color: '#880000' }}>[{l.time}]</span> WARNING: {l.msg}
-                </div>
-              ))}
-              {alertLogs.length === 0 && <p style={{ color: '#444', margin: 0 }}>No detection events recorded...</p>}
             </div>
+
+            {/* Filter Tabs */}
+            <div style={{ display: 'flex', gap: '6px', marginBottom: '10px' }}>
+              {filterTabs.map(({ key, label, color, activeBg }) => {
+                const isActive = alertFilter === key;
+                const count = key === 'all' ? alertLogs.length : alertLogs.filter((l) => l.zone === key).length;
+                return (
+                  <button
+                    key={key}
+                    onClick={() => setAlertFilter(key)}
+                    style={{
+                      flex: 1, padding: '6px 4px', fontFamily: 'monospace',
+                      fontSize: '11px', fontWeight: 'bold', cursor: 'pointer',
+                      borderRadius: '4px', border: `1px solid ${color}`,
+                      background: isActive ? activeBg : 'transparent',
+                      color: color, opacity: isActive ? 1 : 0.45,
+                      transition: 'opacity 0.15s, background 0.15s',
+                    }}
+                  >
+                    {label}
+                    {count > 0 && (
+                      <span style={{ marginLeft: '5px', background: color, color: '#000', borderRadius: '8px', padding: '0 5px', fontSize: '10px', fontWeight: 'bold' }}>
+                        {count}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Log List */}
+            <div style={{ height: '250px', overflowY: 'auto', fontSize: '13px' }}>
+              {filteredAlertLogs.length === 0 && (
+                <p style={{ color: '#444', margin: 0 }}>No detection events recorded...</p>
+              )}
+              {filteredAlertLogs.map((l, i) => {
+                const isRedZone   = l.zone === 'redzone';
+                const textColor   = isRedZone ? '#ff2222' : '#ff8800';
+                const borderColor = isRedZone ? '#440000' : '#331500';
+                const badgeColor  = isRedZone ? '#ff2222' : '#ff8800';
+                const badgeBg     = isRedZone ? '#2a0000' : '#1a0a00';
+                const badgeLabel  = isRedZone ? 'RED ZONE' : 'NOTICE';
+                return (
+                  <div key={i} style={{ borderBottom: `1px solid ${borderColor}`, padding: '7px 0', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <span style={{ color: '#550000', fontSize: '11px', whiteSpace: 'nowrap' }}>[{l.time}]</span>
+                    <span style={{ background: badgeBg, color: badgeColor, border: `1px solid ${badgeColor}`, fontSize: '9px', padding: '1px 5px', borderRadius: '3px', whiteSpace: 'nowrap', fontWeight: 'bold', letterSpacing: '0.5px' }}>
+                      {badgeLabel}
+                    </span>
+                    <span style={{ color: textColor, fontWeight: 'bold', fontSize: '12px' }}>
+                      WARNING: {l.msg}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+
           </div>
 
         </div>

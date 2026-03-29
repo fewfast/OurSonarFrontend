@@ -22,7 +22,6 @@ const CONFIG = {
 
     PORT: 4000,
 
-    // Rate limit: บันทึก radar_scan ทุก N มิลลิวินาที (ป้องกัน MongoDB เต็ม)
     SCAN_SAVE_INTERVAL_MS: 1000,
 };
 
@@ -76,9 +75,11 @@ let systemConfig = {
     degreeLimit:        { min: 0, max: 180 },
     staticLimit:        { min: 45, max: 135 },
     currentStaticAngle: 90,
-    maxDetectCm:        100,   // ← ระยะสูงสุดที่จะ detect วัตถุ (cm)
-    redZoneCm:          30,    // ← เข้าใกล้กว่านี้จะ trigger alert (cm)
+    maxDetectCm:        100,
+    redZoneCm:          30,
 };
+
+let esp32Status = 'OFFLINE';
 
 // ─────────────────────────────────────────
 //  INPUT VALIDATION HELPER
@@ -120,14 +121,12 @@ function validateConfig(patch) {
         }
     }
 
-    // ── ใหม่: validate maxDetectCm และ redZoneCm ──
     if (safe.maxDetectCm !== undefined) {
         safe.maxDetectCm = clampCm(safe.maxDetectCm);
     }
     if (safe.redZoneCm !== undefined) {
         safe.redZoneCm = clampCm(safe.redZoneCm);
     }
-    // ป้องกัน redZone ใหญ่กว่า maxDetect
     if (safe.redZoneCm !== undefined || safe.maxDetectCm !== undefined) {
         const red = safe.redZoneCm   ?? systemConfig.redZoneCm;
         const max = safe.maxDetectCm ?? systemConfig.maxDetectCm;
@@ -136,20 +135,34 @@ function validateConfig(patch) {
         }
     }
 
-    // whitelist fields ที่อนุญาต (ป้องกัน inject field แปลกๆ)
     const ALLOWED = [
         'isSystemOn', 'isAlertOn', 'mode',
         'degreeLimit', 'staticLimit', 'currentStaticAngle',
-        'maxDetectCm', 'redZoneCm',   // ← เพิ่ม
+        'maxDetectCm', 'redZoneCm',
     ];
     Object.keys(safe).forEach((k) => { if (!ALLOWED.includes(k)) delete safe[k]; });
 
-    // validate mode
     if (safe.mode && !['Roam', 'Track', 'Static'].includes(safe.mode)) {
         delete safe.mode;
     }
 
     return safe;
+}
+
+// ─────────────────────────────────────────
+//  แปลง systemConfig → format ที่ ESP32 เข้าใจ
+// ─────────────────────────────────────────
+function toESP32Payload(cfg) {
+    return {
+        isSystemStart: cfg.isSystemOn,
+        isAlert:       cfg.isAlertOn,
+        mode:          cfg.mode,
+        pos:           cfg.currentStaticAngle,
+        minRotate:     cfg.degreeLimit.min,
+        maxRotate:     cfg.degreeLimit.max,
+        maxRange:      cfg.maxDetectCm,
+        RedZone:       cfg.redZoneCm,
+    };
 }
 
 // ─────────────────────────────────────────
@@ -167,9 +180,20 @@ const mqttClient = mqtt.connect({
 
 mqttClient.on('connect', () => {
     console.log('✅ Connected to HiveMQ Cloud');
+
+    // รับ radar scan จาก ESP32
     mqttClient.subscribe('rtos/radar_data', (err) => {
         if (!err) console.log('📡 Subscribed to rtos/radar_data');
     });
+
+    // รับ status จาก ESP32
+    mqttClient.subscribe('BeanNian/esp32/status', (err) => {
+        if (!err) console.log('📡 Subscribed to BeanNian/esp32/status');
+    });
+
+    // หมายเหตุ: ไม่ subscribe BeanNian/esp32/report
+    // ESP32 ยัง publish topic นั้นอยู่ แต่ Backend ไม่รับ
+    // เพื่อป้องกัน radar_scan ถูก emit ซ้ำ 2 ครั้งต่อ tick
 });
 
 mqttClient.on('error', (err) => console.error('❌ MQTT Error:', err.message));
@@ -180,18 +204,26 @@ mqttClient.on('reconnect', () => console.log('🔄 MQTT reconnecting...'));
 // ─────────────────────────────────────────
 let lastScanSaveTime = 0;
 
-// รับข้อมูลจาก ESP32
 mqttClient.on('message', async (topic, message) => {
+
+    // รับ ESP32 status
+    if (topic === 'BeanNian/esp32/status') {
+        const raw = message.toString();
+        esp32Status = raw.includes('Connected') ? 'ONLINE' : 'OFFLINE';
+        console.log(`📶 ESP32 status: ${esp32Status}`);
+        io.emit('esp32_status', esp32Status);
+        return;
+    }
+
+    // รับ radar scan — topic เดียวที่ process
     if (topic !== 'rtos/radar_data') return;
     if (!systemConfig.isSystemOn) return;
 
     try {
         const data = JSON.parse(message.toString());
 
-        // validate ข้อมูลจาก ESP32
         if (typeof data.angle !== 'number' || typeof data.distance !== 'number') return;
 
-        // ── ใหม่: hasObject = อยู่ในช่วง maxDetect เท่านั้น ──
         const inDetectRange = data.distance > 0 && data.distance <= systemConfig.maxDetectCm;
         const hasObject     = inDetectRange;
         const inRedZone     = inDetectRange && data.distance <= systemConfig.redZoneCm;
@@ -213,7 +245,7 @@ mqttClient.on('message', async (topic, message) => {
             lastScanSaveTime = now;
         }
 
-        // 3. Alert: trigger เฉพาะเมื่อเข้า Red Zone + เปิด Alert
+        // 3. Alert
         if (inRedZone && systemConfig.isAlertOn) {
             const logEntry = {
                 type: 'ALERT',
@@ -234,15 +266,13 @@ mqttClient.on('message', async (topic, message) => {
 io.on('connection', (socket) => {
     console.log('🌐 Dashboard Connected:', socket.id);
 
-    // ส่ง config ปัจจุบันให้ client ทันที
     socket.emit('sync_config', systemConfig);
+    socket.emit('esp32_status', esp32Status);
 
     socket.on('update_config', async (rawPatch) => {
-        // Validate & sanitize input จาก client
         const patch = validateConfig(rawPatch);
         if (!patch || Object.keys(patch).length === 0) return;
 
-        // LOG: เปิด/ปิดระบบ
         if (patch.isSystemOn !== undefined && patch.isSystemOn !== systemConfig.isSystemOn) {
             const logEntry = {
                 type: 'SYSTEM',
@@ -253,7 +283,6 @@ io.on('connection', (socket) => {
             await saveLog(logEntry);
         }
 
-        // LOG: เปลี่ยน Mode
         if (patch.mode !== undefined && patch.mode !== systemConfig.mode) {
             const logEntry = {
                 type: 'SYSTEM',
@@ -264,7 +293,6 @@ io.on('connection', (socket) => {
             await saveLog(logEntry);
         }
 
-        // LOG: เปิด/ปิด Alert
         if (patch.isAlertOn !== undefined && patch.isAlertOn !== systemConfig.isAlertOn) {
             const logEntry = {
                 type: 'SYSTEM',
@@ -275,7 +303,6 @@ io.on('connection', (socket) => {
             await saveLog(logEntry);
         }
 
-        // LOG: เปลี่ยน maxDetectCm
         if (patch.maxDetectCm !== undefined && patch.maxDetectCm !== systemConfig.maxDetectCm) {
             const logEntry = {
                 type: 'SYSTEM',
@@ -286,7 +313,6 @@ io.on('connection', (socket) => {
             await saveLog(logEntry);
         }
 
-        // LOG: เปลี่ยน redZoneCm
         if (patch.redZoneCm !== undefined && patch.redZoneCm !== systemConfig.redZoneCm) {
             const logEntry = {
                 type: 'SYSTEM',
@@ -297,13 +323,13 @@ io.on('connection', (socket) => {
             await saveLog(logEntry);
         }
 
-        // อัปเดต in-memory config
         systemConfig = { ...systemConfig, ...patch };
 
-        // ส่งค่าใหม่ไปให้ ESP32 ผ่าน HiveMQ
-        mqttClient.publish('rtos/set_config', JSON.stringify(systemConfig));
+        mqttClient.publish(
+            'BeanNian/esp32/state',
+            JSON.stringify(toESP32Payload(systemConfig))
+        );
 
-        // Broadcast config ให้ทุก client
         io.emit('sync_config', systemConfig);
     });
 
@@ -316,7 +342,6 @@ io.on('connection', (socket) => {
 //  REST API
 // ─────────────────────────────────────────
 
-// GET /api/logs?limit=100&type=ALERT
 app.get('/api/logs', async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
@@ -332,7 +357,6 @@ app.get('/api/logs', async (req, res) => {
     }
 });
 
-// GET /api/radar_scans?limit=500
 app.get('/api/radar_scans', async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 500, 5000);
@@ -347,12 +371,10 @@ app.get('/api/radar_scans', async (req, res) => {
     }
 });
 
-// GET /api/config
 app.get('/api/config', (_req, res) => {
     res.json(systemConfig);
 });
 
-// GET /api/stats — สรุปสถิติ
 app.get('/api/stats', async (req, res) => {
     try {
         const [alertCount, systemCount, scanCount, latestAlert] = await Promise.all([
