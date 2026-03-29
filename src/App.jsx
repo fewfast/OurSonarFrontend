@@ -1,16 +1,42 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import io from "socket.io-client";
 
-const socket = io("https://oursonarbackend.onrender.com/");
+const BACKEND_URL = "https://oursonarbackend.onrender.com";
+const socket = io(BACKEND_URL, {
+  reconnection: true,
+  reconnectionAttempts: Infinity,
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 5000,
+  timeout: 20000,
+});
 
-// ─────────────────────────────────────────
-//  CONSTANTS
-// ─────────────────────────────────────────
 const CANVAS_W = 600;
 const CANVAS_H = 300;
 const CX = CANVAS_W / 2;
 const CY = CANVAS_H;
 const RADAR_R = CANVAS_H - 20;
+
+const toBackendPatch = (patch) => {
+  const map = {
+    isSystemOn: "isSystemStart",
+    isAlertOn: "isAlert",
+    mode: "mode",
+    currentStaticAngle: "pos",
+    maxDetectCm: "maxRange",
+    redZoneCm: "RedZone",
+    degreeLimit: null,
+  };
+  const result = {};
+  for (const [key, val] of Object.entries(patch)) {
+    if (key === "degreeLimit") {
+      if (val.min !== undefined) result.minRotate = val.min;
+      if (val.max !== undefined) result.maxRotate = val.max;
+    } else if (map[key]) {
+      result[map[key]] = val;
+    }
+  }
+  return result;
+};
 
 function App() {
   const [config, setConfig] = useState({
@@ -18,7 +44,6 @@ function App() {
     isAlertOn: false,
     mode: "Static",
     degreeLimit: { min: 0, max: 180 },
-    staticLimit: { min: 45, max: 135 },
     currentStaticAngle: 90,
     maxDetectCm: 100,
     redZoneCm: 30,
@@ -29,12 +54,15 @@ function App() {
   const [alertFilter, setAlertFilter] = useState("all");
   const [systemLogs, setSystemLogs] = useState([]);
   const [esp32Status, setEsp32Status] = useState("OFFLINE");
+  const [socketConnected, setSocketConnected] = useState(false);
 
   const [draft, setDraft] = useState({
     degreeMin: "0",
     degreeMax: "180",
     maxDetect: "100",
     redZone: "30",
+    rotateMin: "0",
+    rotateMax: "180",
   });
 
   const [errors, setErrors] = useState({
@@ -42,23 +70,44 @@ function App() {
     degreeMax: "",
     maxDetect: "",
     redZone: "",
+    rotateMin: "",
+    rotateMax: "",
   });
 
   const canvasRef = useRef(null);
 
-  const syncDraftFromConfig = (cfg) => {
-    setDraft({
-      degreeMin: String(cfg.degreeLimit.min),
-      degreeMax: String(cfg.degreeLimit.max),
-      maxDetect: String(cfg.maxDetectCm),
-      redZone: String(cfg.redZoneCm),
-    });
-    setErrors({ degreeMin: "", degreeMax: "", maxDetect: "", redZone: "" });
+  const addSystemLog = (msg) => {
+    setSystemLogs((prev) =>
+      [{ time: new Date().toLocaleTimeString(), msg }, ...prev].slice(0, 10),
+    );
   };
 
-  // ─────────────────────────────────────────
-  //  วาด Radar Grid ว่างๆ (ตอน mount)
-  // ─────────────────────────────────────────
+  const syncFromBackendState = (data) => {
+    setConfig((prev) => ({
+      ...prev,
+      isSystemOn: data.isSystemStart ?? prev.isSystemOn,
+      isAlertOn: data.isAlert ?? prev.isAlertOn,
+      mode: data.mode ?? prev.mode,
+      currentStaticAngle: data.pos ?? prev.currentStaticAngle,
+      maxDetectCm: data.maxRange ?? prev.maxDetectCm,
+      redZoneCm: data.RedZone ?? prev.redZoneCm,
+      degreeLimit: {
+        min: data.minRotate ?? prev.degreeLimit.min,
+        max: data.maxRotate ?? prev.degreeLimit.max,
+      },
+    }));
+    setDraft((prev) => ({
+      ...prev,
+      degreeMin: String(data.minRotate ?? prev.degreeMin),
+      degreeMax: String(data.maxRotate ?? prev.degreeMax),
+      maxDetect: String(data.maxRange ?? prev.maxDetect),
+      redZone: String(data.RedZone ?? prev.redZone),
+      rotateMin: String(data.minRotate ?? prev.rotateMin),
+      rotateMax: String(data.maxRotate ?? prev.rotateMax),
+    }));
+    if (data.pos !== undefined) setCurrentAngle(data.pos);
+  };
+
   const drawEmptyRadar = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -66,7 +115,6 @@ function App() {
     ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
-
     [0.25, 0.5, 0.75, 1].forEach((scale) => {
       ctx.beginPath();
       ctx.arc(CX, CY, RADAR_R * scale, Math.PI, 2 * Math.PI);
@@ -74,7 +122,6 @@ function App() {
       ctx.lineWidth = 1;
       ctx.stroke();
     });
-
     for (let deg = 0; deg <= 180; deg += 30) {
       const rad = (deg * Math.PI) / 180;
       ctx.beginPath();
@@ -86,7 +133,6 @@ function App() {
       ctx.strokeStyle = "#002200";
       ctx.lineWidth = 0.5;
       ctx.stroke();
-
       const lx = CX + (RADAR_R + 12) * Math.cos(Math.PI - rad);
       const ly = CY - (RADAR_R + 12) * Math.sin(rad);
       ctx.fillStyle = "#005500";
@@ -96,17 +142,12 @@ function App() {
     }
   }, []);
 
-  // ─────────────────────────────────────────
-  //  วาด Radar Sweep
-  // ─────────────────────────────────────────
   const drawRadar = useCallback((data, cfg) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
-
     ctx.fillStyle = "rgba(0, 0, 0, 0.08)";
     ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
-
     [0.25, 0.5, 0.75, 1].forEach((scale) => {
       ctx.beginPath();
       ctx.arc(CX, CY, RADAR_R * scale, Math.PI, 2 * Math.PI);
@@ -114,7 +155,6 @@ function App() {
       ctx.lineWidth = 1;
       ctx.stroke();
     });
-
     if (cfg && cfg.maxDetectCm > 0) {
       const redRatio = Math.min(cfg.redZoneCm / cfg.maxDetectCm, 1);
       ctx.beginPath();
@@ -125,11 +165,9 @@ function App() {
       ctx.stroke();
       ctx.setLineDash([]);
     }
-
     const rad = (data.angle * Math.PI) / 180;
     const ex = CX + RADAR_R * Math.cos(Math.PI - rad);
     const ey = CY - RADAR_R * Math.sin(rad);
-
     ctx.beginPath();
     ctx.moveTo(CX, CY);
     ctx.lineTo(ex, ey);
@@ -139,13 +177,11 @@ function App() {
     ctx.shadowBlur = 6;
     ctx.stroke();
     ctx.shadowBlur = 0;
-
     if (data.hasObject && data.distance > 0 && cfg && cfg.maxDetectCm > 0) {
       const ratio = Math.min(data.distance / cfg.maxDetectCm, 1);
       const dotR = ratio * RADAR_R;
       const dx = CX + dotR * Math.cos(Math.PI - rad);
       const dy = CY - dotR * Math.sin(rad);
-
       const isRed = data.inRedZone;
       ctx.beginPath();
       ctx.arc(dx, dy, isRed ? 8 : 6, 0, 2 * Math.PI);
@@ -157,45 +193,70 @@ function App() {
     }
   }, []);
 
-  // ─────────────────────────────────────────
-  //  Socket.IO Events
-  // ─────────────────────────────────────────
   const configRef = useRef(config);
   useEffect(() => {
     configRef.current = config;
   }, [config]);
 
+  // ── Socket useEffect (รวม fetch initial state ไว้ใน connect) ──
   useEffect(() => {
-    socket.on("sync_config", (data) => {
-      setConfig(data);
-      syncDraftFromConfig(data);
-      if (data.currentStaticAngle !== undefined) {
-        setCurrentAngle(data.currentStaticAngle);
+    socket.on("connect", () => {
+      setSocketConnected(true);
+      addSystemLog("Socket connected to server");
+
+      // fetch state ทันทีหลัง socket connect สำเร็จ
+      fetch(`${BACKEND_URL}/state`)
+        .then((res) => res.json())
+        .then((data) => {
+          syncFromBackendState(data);
+          addSystemLog("Initial state loaded from server");
+        })
+        .catch(() => addSystemLog("⚠ Failed to load initial state"));
+    });
+    socket.on("disconnect", () => {
+      setSocketConnected(false);
+      addSystemLog("Socket disconnected");
+    });
+    socket.on("state", (data) => {
+      syncFromBackendState(data);
+      addSystemLog("Config synced from server");
+    });
+    socket.on("status", (data) => {
+      const s =
+        data.status === "online"
+          ? "ONLINE"
+          : data.status === "updated"
+            ? "ONLINE"
+            : "OFFLINE";
+      setEsp32Status(s);
+      addSystemLog(`ESP32 ${s}`);
+    });
+    socket.on("report", (data) => {
+      if (data.angle !== undefined) {
+        setCurrentAngle(data.angle);
+        drawRadar(data, configRef.current);
+      }
+      if (data.inRedZone) {
+        setAlertLogs((prev) =>
+          [
+            {
+              time: new Date().toLocaleTimeString(),
+              msg: `Object at ${data.distance}cm, angle ${data.angle}°`,
+              zone: "redzone",
+              type: "ALERT",
+            },
+            ...prev,
+          ].slice(0, 20),
+        );
       }
     });
-
-    socket.on("new_log", (log) => {
-      if (log.type === "ALERT") {
-        const enriched = {
-          ...log,
-          zone: log.zone ?? (log.inRedZone ? "redzone" : "notice"),
-        };
-        setAlertLogs((prev) => [enriched, ...prev].slice(0, 20));
-      } else {
-        setSystemLogs((prev) => [log, ...prev].slice(0, 10));
-      }
-    });
-
-    socket.on("radar_scan", (data) => {
-      setCurrentAngle(data.angle);
-      drawRadar(data, configRef.current);
-    });
-
-    socket.on("esp32_status", (status) => {
-      setEsp32Status(status);
-    });
-
-    return () => socket.off();
+    return () => {
+      socket.off("connect");
+      socket.off("disconnect");
+      socket.off("state");
+      socket.off("status");
+      socket.off("report");
+    };
   }, [drawRadar]);
 
   useEffect(() => {
@@ -205,10 +266,35 @@ function App() {
     drawEmptyRadar();
   }, [config.mode, drawEmptyRadar]);
 
-  // ─────────────────────────────────────────
-  //  Helpers
-  // ─────────────────────────────────────────
-  const updateConfig = (patch) => socket.emit("update_config", patch);
+  const updateConfig = async (patch) => {
+    setConfig((prev) => {
+      const next = { ...prev };
+      if (patch.isSystemOn !== undefined) next.isSystemOn = patch.isSystemOn;
+      if (patch.isAlertOn !== undefined) next.isAlertOn = patch.isAlertOn;
+      if (patch.mode !== undefined) next.mode = patch.mode;
+      if (patch.currentStaticAngle !== undefined)
+        next.currentStaticAngle = patch.currentStaticAngle;
+      if (patch.maxDetectCm !== undefined) next.maxDetectCm = patch.maxDetectCm;
+      if (patch.redZoneCm !== undefined) next.redZoneCm = patch.redZoneCm;
+      if (patch.degreeLimit !== undefined)
+        next.degreeLimit = { ...prev.degreeLimit, ...patch.degreeLimit };
+      return next;
+    });
+    const backendPatch = toBackendPatch(patch);
+    try {
+      const res = await fetch(`${BACKEND_URL}/state`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(backendPatch),
+      });
+      const json = await res.json();
+      console.log("✅ PATCH /state:", json);
+      addSystemLog(`Config updated: ${Object.keys(backendPatch).join(", ")}`);
+    } catch (err) {
+      console.error("🔴 PATCH /state error:", err);
+      addSystemLog("⚠ Failed to update config");
+    }
+  };
 
   const moveStatic = (direction) => {
     let newAngle = direction === "left" ? currentAngle - 5 : currentAngle + 5;
@@ -219,9 +305,6 @@ function App() {
 
   const toInt = (raw) => parseInt(raw, 10);
 
-  // ─────────────────────────────────────────
-  //  Live onChange handlers
-  // ─────────────────────────────────────────
   const handleDegreeMin = (raw) => {
     setDraft((d) => ({ ...d, degreeMin: raw }));
     const val = toInt(raw);
@@ -237,10 +320,8 @@ function App() {
       return;
     }
     setErrors((e) => ({ ...e, degreeMin: "" }));
-    setConfig((c) => ({ ...c, degreeLimit: { ...c.degreeLimit, min: val } }));
     updateConfig({ degreeLimit: { ...config.degreeLimit, min: val } });
   };
-
   const handleDegreeMax = (raw) => {
     setDraft((d) => ({ ...d, degreeMax: raw }));
     const val = toInt(raw);
@@ -256,10 +337,8 @@ function App() {
       return;
     }
     setErrors((e) => ({ ...e, degreeMax: "" }));
-    setConfig((c) => ({ ...c, degreeLimit: { ...c.degreeLimit, max: val } }));
     updateConfig({ degreeLimit: { ...config.degreeLimit, max: val } });
   };
-
   const handleMaxDetect = (raw) => {
     setDraft((d) => ({ ...d, maxDetect: raw }));
     const val = toInt(raw);
@@ -275,10 +354,8 @@ function App() {
       return;
     }
     setErrors((e) => ({ ...e, maxDetect: "" }));
-    setConfig((c) => ({ ...c, maxDetectCm: val }));
     updateConfig({ maxDetectCm: val });
   };
-
   const handleRedZone = (raw) => {
     setDraft((d) => ({ ...d, redZone: raw }));
     const val = toInt(raw);
@@ -294,23 +371,52 @@ function App() {
       return;
     }
     setErrors((e) => ({ ...e, redZone: "" }));
-    setConfig((c) => ({ ...c, redZoneCm: val }));
     updateConfig({ redZoneCm: val });
   };
 
-  // ─────────────────────────────────────────
-  //  Filtered logs
-  // ─────────────────────────────────────────
+  const handleRotateMin = (raw) => {
+    setDraft((d) => ({ ...d, rotateMin: raw }));
+    const val = toInt(raw);
+    const curMax = toInt(draft.rotateMax);
+    if (isNaN(val) || val < 0 || val > 180) {
+      setErrors((e) => ({ ...e, rotateMin: "ต้องเป็นตัวเลข 0–180°" }));
+      return;
+    }
+    if (val >= curMax) {
+      setErrors((e) => ({
+        ...e,
+        rotateMin: `Min ต้องน้อยกว่า Max Rotate (${curMax}°)`,
+      }));
+      return;
+    }
+    setErrors((e) => ({ ...e, rotateMin: "" }));
+    updateConfig({ degreeLimit: { min: val, max: curMax } });
+  };
+
+  const handleRotateMax = (raw) => {
+    setDraft((d) => ({ ...d, rotateMax: raw }));
+    const val = toInt(raw);
+    const curMin = toInt(draft.rotateMin);
+    if (isNaN(val) || val < 0 || val > 180) {
+      setErrors((e) => ({ ...e, rotateMax: "ต้องเป็นตัวเลข 0–180°" }));
+      return;
+    }
+    if (val <= curMin) {
+      setErrors((e) => ({
+        ...e,
+        rotateMax: `Max ต้องมากกว่า Min Rotate (${curMin}°)`,
+      }));
+      return;
+    }
+    setErrors((e) => ({ ...e, rotateMax: "" }));
+    updateConfig({ degreeLimit: { min: curMin, max: val } });
+  };
+
   const filteredAlertLogs =
     alertFilter === "all"
       ? alertLogs
       : alertLogs.filter((l) => l.zone === alertFilter);
 
-  // ─────────────────────────────────────────
-  //  Log zone theme  ← จุดที่เปลี่ยนสี
-  //  notice  = ขาว/เทาสว่าง
-  //  redzone = แดง
-  // ─────────────────────────────────────────
   const zoneTheme = {
     notice: {
       rowBorder: "#2a2a2a",
@@ -332,9 +438,6 @@ function App() {
     },
   };
 
-  // ─────────────────────────────────────────
-  //  Styles
-  // ─────────────────────────────────────────
   const s = {
     page: {
       padding: "20px",
@@ -437,15 +540,32 @@ function App() {
 
   return (
     <div style={s.page}>
-      <h2 style={{ borderBottom: "2px solid #0f0", paddingBottom: "10px" }}>
+      <h2
+        style={{
+          borderBottom: "2px solid #0f0",
+          paddingBottom: "10px",
+          display: "flex",
+          alignItems: "center",
+          gap: "12px",
+        }}
+      >
         🛰️ RTOS RADAR COMMAND CENTER
+        <span
+          style={{
+            fontSize: "12px",
+            fontWeight: "normal",
+            color: socketConnected ? "#0f0" : "#f00",
+          }}
+        >
+          {socketConnected ? "● CONNECTED" : "● DISCONNECTED"}
+        </span>
       </h2>
 
       <div style={s.grid}>
-        {/* ── Left: Controls ── */}
+        {/* ── Left ── */}
         <div style={s.col}>
           <div style={s.panel}>
-            {/* System & Alert Buttons */}
+            {/* System & Alert */}
             <div style={{ display: "flex", gap: "10px", marginBottom: "15px" }}>
               <button
                 onClick={() => updateConfig({ isSystemOn: !config.isSystemOn })}
@@ -461,10 +581,10 @@ function App() {
               </button>
             </div>
 
-            {/* Mode Selection */}
+            {/* Mode */}
             <h4 style={{ margin: "0 0 8px 0" }}>MODE SELECTION</h4>
             <div style={{ display: "flex", gap: "5px", marginBottom: "15px" }}>
-              {["Roam", "Track", "Static"].map((m) => (
+              {["ROAM", "TRACK", "STATIC"].map((m) => (
                 <button
                   key={m}
                   onClick={() => updateConfig({ mode: m })}
@@ -475,8 +595,8 @@ function App() {
               ))}
             </div>
 
-            {/* Static Mode: Manual Rotation */}
-            {config.mode === "Static" && (
+            {/* Static: Manual Rotation */}
+            {config.mode === "STATIC" && (
               <div
                 style={{
                   textAlign: "center",
@@ -541,7 +661,7 @@ function App() {
               </div>
             )}
 
-            {/* Roam/Track: Rotation Limit */}
+            {/* Roam/Track: Rotation Limit (เดิม) */}
             {(config.mode === "Roam" || config.mode === "Track") && (
               <>
                 <h4 style={{ margin: "0 0 8px 0" }}>
@@ -591,6 +711,58 @@ function App() {
                 </div>
                 <ErrMsg msg={errors.degreeMin} />
                 <ErrMsg msg={errors.degreeMax} />
+                <div style={{ marginBottom: "15px" }} />
+              </>
+            )}
+
+            {/* ROTATE RANGE: ซ่อนเมื่อ mode = STATIC */}
+            {config.mode !== "STATIC" && (
+              <>
+                <h4 style={{ margin: "0 0 8px 0" }}>ROTATE RANGE (0–180°)</h4>
+                <div
+                  style={{ display: "flex", gap: "20px", marginBottom: "4px" }}
+                >
+                  <div>
+                    <div
+                      style={{
+                        marginBottom: "4px",
+                        fontSize: "12px",
+                        color: "#888",
+                      }}
+                    >
+                      Min Rotate
+                    </div>
+                    <input
+                      type="number"
+                      min="0"
+                      max="180"
+                      value={draft.rotateMin}
+                      onChange={(e) => handleRotateMin(e.target.value)}
+                      style={errors.rotateMin ? s.inputErr : s.input}
+                    />
+                  </div>
+                  <div>
+                    <div
+                      style={{
+                        marginBottom: "4px",
+                        fontSize: "12px",
+                        color: "#888",
+                      }}
+                    >
+                      Max Rotate
+                    </div>
+                    <input
+                      type="number"
+                      min="0"
+                      max="180"
+                      value={draft.rotateMax}
+                      onChange={(e) => handleRotateMax(e.target.value)}
+                      style={errors.rotateMax ? s.inputErr : s.input}
+                    />
+                  </div>
+                </div>
+                <ErrMsg msg={errors.rotateMin} />
+                <ErrMsg msg={errors.rotateMax} />
                 <div style={{ marginBottom: "15px" }} />
               </>
             )}
@@ -730,9 +902,8 @@ function App() {
           </div>
         </div>
 
-        {/* ── Right: Radar + Alert Logs ── */}
+        {/* ── Right ── */}
         <div style={s.col}>
-          {/* Radar Canvas */}
           <div
             style={{
               background: "#000",
@@ -834,8 +1005,6 @@ function App() {
                 </button>
               )}
             </div>
-
-            {/* Filter Tabs */}
             <div style={{ display: "flex", gap: "6px", marginBottom: "10px" }}>
               {filterTabs.map(({ key, label, color, activeBg }) => {
                 const isActive = alertFilter === key;
@@ -857,7 +1026,7 @@ function App() {
                       borderRadius: "4px",
                       border: `1px solid ${color}`,
                       background: isActive ? activeBg : "transparent",
-                      color: color,
+                      color,
                       opacity: isActive ? 1 : 0.45,
                       transition: "opacity 0.15s, background 0.15s",
                     }}
@@ -882,8 +1051,6 @@ function App() {
                 );
               })}
             </div>
-
-            {/* Log List */}
             <div
               style={{ height: "250px", overflowY: "auto", fontSize: "13px" }}
             >
