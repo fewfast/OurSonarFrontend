@@ -181,19 +181,13 @@ const mqttClient = mqtt.connect({
 mqttClient.on('connect', () => {
     console.log('✅ Connected to HiveMQ Cloud');
 
-    // รับ radar scan จาก ESP32
     mqttClient.subscribe('rtos/radar_data', (err) => {
         if (!err) console.log('📡 Subscribed to rtos/radar_data');
     });
 
-    // รับ status จาก ESP32
     mqttClient.subscribe('BeanNian/esp32/status', (err) => {
         if (!err) console.log('📡 Subscribed to BeanNian/esp32/status');
     });
-
-    // หมายเหตุ: ไม่ subscribe BeanNian/esp32/report
-    // ESP32 ยัง publish topic นั้นอยู่ แต่ Backend ไม่รับ
-    // เพื่อป้องกัน radar_scan ถูก emit ซ้ำ 2 ครั้งต่อ tick
 });
 
 mqttClient.on('error', (err) => console.error('❌ MQTT Error:', err.message));
@@ -206,7 +200,6 @@ let lastScanSaveTime = 0;
 
 mqttClient.on('message', async (topic, message) => {
 
-    // รับ ESP32 status
     if (topic === 'BeanNian/esp32/status') {
         const raw = message.toString();
         esp32Status = raw.includes('Connected') ? 'ONLINE' : 'OFFLINE';
@@ -215,7 +208,6 @@ mqttClient.on('message', async (topic, message) => {
         return;
     }
 
-    // รับ radar scan — topic เดียวที่ process
     if (topic !== 'rtos/radar_data') return;
     if (!systemConfig.isSystemOn) return;
 
@@ -235,17 +227,14 @@ mqttClient.on('message', async (topic, message) => {
             inRedZone,
         };
 
-        // 1. ส่งข้อมูล Radar ไป Dashboard
         io.emit('radar_scan', scanPayload);
 
-        // 2. บันทึก radar scan ลง MongoDB (Rate limited)
         const now = Date.now();
         if (now - lastScanSaveTime >= CONFIG.SCAN_SAVE_INTERVAL_MS) {
             await saveRadarScan(scanPayload);
             lastScanSaveTime = now;
         }
 
-        // 3. Alert
         if (inRedZone && systemConfig.isAlertOn) {
             const logEntry = {
                 type: 'ALERT',
@@ -339,57 +328,6 @@ io.on('connection', (socket) => {
 });
 
 // ─────────────────────────────────────────
-//  REST API
-// ─────────────────────────────────────────
-
-app.get('/api/logs', async (req, res) => {
-    try {
-        const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
-        const filter = req.query.type ? { type: req.query.type } : {};
-        const logs = await db.collection('logs')
-            .find(filter)
-            .sort({ createdAt: -1 })
-            .limit(limit)
-            .toArray();
-        res.json(logs);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.get('/api/radar_scans', async (req, res) => {
-    try {
-        const limit = Math.min(parseInt(req.query.limit) || 500, 5000);
-        const scans = await db.collection('radar_scans')
-            .find({})
-            .sort({ createdAt: -1 })
-            .limit(limit)
-            .toArray();
-        res.json(scans);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.get('/api/config', (_req, res) => {
-    res.json(systemConfig);
-});
-
-app.get('/api/stats', async (req, res) => {
-    try {
-        const [alertCount, systemCount, scanCount, latestAlert] = await Promise.all([
-            db.collection('logs').countDocuments({ type: 'ALERT' }),
-            db.collection('logs').countDocuments({ type: 'SYSTEM' }),
-            db.collection('radar_scans').countDocuments(),
-            db.collection('logs').findOne({ type: 'ALERT' }, { sort: { createdAt: -1 } }),
-        ]);
-        res.json({ alertCount, systemCount, scanCount, latestAlert });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// ─────────────────────────────────────────
 //  GRACEFUL SHUTDOWN
 // ─────────────────────────────────────────
 async function gracefulShutdown(signal) {
@@ -412,6 +350,19 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 // ─────────────────────────────────────────
 connectMongo()
     .then(() => {
+        // ─────────────────────────────────────────
+        //  ROUTES — mount หลัง db พร้อม
+        // ─────────────────────────────────────────
+        const logsRoute   = require('./routes/logs');
+        const radarRoute  = require('./routes/radar');
+        const configRoute = require('./routes/config');
+        const statsRoute  = require('./routes/stats');
+
+        app.use('/api/logs',        logsRoute(db));
+        app.use('/api/radar_scans', radarRoute(db));
+        app.use('/api/config',      configRoute(() => systemConfig));
+        app.use('/api/stats',       statsRoute(db));
+
         server.listen(CONFIG.PORT, () => {
             console.log(`🚀 RTOS Command Server running on port ${CONFIG.PORT}`);
         });
