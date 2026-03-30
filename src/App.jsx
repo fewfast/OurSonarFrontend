@@ -177,12 +177,10 @@ function App() {
   const [draft, setDraft] = useState({
     degreeMin: "0", degreeMax: "180",
     maxDetect: "100", redZone: "30",
-    rotateMin: "0", rotateMax: "180",
   });
   const [errors, setErrors] = useState({
     degreeMin: "", degreeMax: "",
     maxDetect: "", redZone: "",
-    rotateMin: "", rotateMax: "",
   });
 
   const canvasRef = useRef(null);
@@ -213,8 +211,6 @@ function App() {
       degreeMax: String(data.maxRotate ?? prev.degreeMax),
       maxDetect: String(data.maxRange ?? prev.maxDetect),
       redZone: String(data.RedZone ?? prev.redZone),
-      rotateMin: String(data.minRotate ?? prev.rotateMin),
-      rotateMax: String(data.maxRotate ?? prev.rotateMax),
     }));
     if (data.pos !== undefined) setCurrentAngle(data.pos);
   };
@@ -582,55 +578,63 @@ function App() {
 
   const toInt = (raw) => parseInt(raw, 10);
 
+  // onChange: เก็บค่า draft + validate เฉยๆ (ไม่ส่ง backend)
+  // onBlur: ถ้าไม่มี error ค่อยส่ง backend
+
   const handleDegreeMin = (raw) => {
     setDraft((d) => ({ ...d, degreeMin: raw }));
     const val = toInt(raw);
     if (isNaN(val) || val < 0 || val > 180) { setErrors((e) => ({ ...e, degreeMin: "ต้องเป็นตัวเลข 0–180°" })); return; }
     if (val >= config.degreeLimit.max) { setErrors((e) => ({ ...e, degreeMin: `Min ต้องน้อยกว่า Max (${config.degreeLimit.max}°)` })); return; }
     setErrors((e) => ({ ...e, degreeMin: "" }));
-    updateConfig({ degreeLimit: { ...config.degreeLimit, min: val } });
   };
+  const commitDegreeMin = (raw) => {
+    const val = toInt(raw);
+    const cfg = configRef.current;
+    if (isNaN(val) || val < 0 || val > 180 || val >= cfg.degreeLimit.max) return;
+    updateConfig({ degreeLimit: { ...cfg.degreeLimit, min: val } });
+  };
+
   const handleDegreeMax = (raw) => {
     setDraft((d) => ({ ...d, degreeMax: raw }));
     const val = toInt(raw);
     if (isNaN(val) || val < 0 || val > 180) { setErrors((e) => ({ ...e, degreeMax: "ต้องเป็นตัวเลข 0–180°" })); return; }
     if (val <= config.degreeLimit.min) { setErrors((e) => ({ ...e, degreeMax: `Max ต้องมากกว่า Min (${config.degreeLimit.min}°)` })); return; }
     setErrors((e) => ({ ...e, degreeMax: "" }));
-    updateConfig({ degreeLimit: { ...config.degreeLimit, max: val } });
   };
+  const commitDegreeMax = (raw) => {
+    const val = toInt(raw);
+    const cfg = configRef.current;
+    if (isNaN(val) || val < 0 || val > 180 || val <= cfg.degreeLimit.min) return;
+    updateConfig({ degreeLimit: { ...cfg.degreeLimit, max: val } });
+  };
+
   const handleMaxDetect = (raw) => {
     setDraft((d) => ({ ...d, maxDetect: raw }));
     const val = toInt(raw);
-    if (isNaN(val) || val < 1 || val > 500) { setErrors((e) => ({ ...e, maxDetect: "ต้องเป็นตัวเลข 1–500 cm" })); return; }
+    if (isNaN(val) || val < 1 || val > 400) { setErrors((e) => ({ ...e, maxDetect: "ต้องเป็นตัวเลข 1–400 cm" })); return; }
     if (val < config.redZoneCm) { setErrors((e) => ({ ...e, maxDetect: `Max Detect ต้องไม่น้อยกว่า Red Zone (${config.redZoneCm} cm)` })); return; }
     setErrors((e) => ({ ...e, maxDetect: "" }));
+  };
+  const commitMaxDetect = (raw) => {
+    const val = toInt(raw);
+    const cfg = configRef.current;
+    if (isNaN(val) || val < 1 || val > 400 || val < cfg.redZoneCm) return;
     updateConfig({ maxDetectCm: val });
   };
+
   const handleRedZone = (raw) => {
     setDraft((d) => ({ ...d, redZone: raw }));
     const val = toInt(raw);
-    if (isNaN(val) || val < 1 || val > 500) { setErrors((e) => ({ ...e, redZone: "ต้องเป็นตัวเลข 1–500 cm" })); return; }
+    if (isNaN(val) || val < 1 || val > 400) { setErrors((e) => ({ ...e, redZone: "ต้องเป็นตัวเลข 1–400 cm" })); return; }
     if (val > config.maxDetectCm) { setErrors((e) => ({ ...e, redZone: `Red Zone ต้องไม่เกิน Max Detect (${config.maxDetectCm} cm)` })); return; }
     setErrors((e) => ({ ...e, redZone: "" }));
+  };
+  const commitRedZone = (raw) => {
+    const val = toInt(raw);
+    const cfg = configRef.current;
+    if (isNaN(val) || val < 1 || val > 400 || val > cfg.maxDetectCm) return;
     updateConfig({ redZoneCm: val });
-  };
-  const handleRotateMin = (raw) => {
-    setDraft((d) => ({ ...d, rotateMin: raw }));
-    const val = toInt(raw);
-    const curMax = toInt(draft.rotateMax);
-    if (isNaN(val) || val < 0 || val > 180) { setErrors((e) => ({ ...e, rotateMin: "ต้องเป็นตัวเลข 0–180°" })); return; }
-    if (val >= curMax) { setErrors((e) => ({ ...e, rotateMin: `Min ต้องน้อยกว่า Max Rotate (${curMax}°)` })); return; }
-    setErrors((e) => ({ ...e, rotateMin: "" }));
-    updateConfig({ degreeLimit: { min: val, max: curMax } });
-  };
-  const handleRotateMax = (raw) => {
-    setDraft((d) => ({ ...d, rotateMax: raw }));
-    const val = toInt(raw);
-    const curMin = toInt(draft.rotateMin);
-    if (isNaN(val) || val < 0 || val > 180) { setErrors((e) => ({ ...e, rotateMax: "ต้องเป็นตัวเลข 0–180°" })); return; }
-    if (val <= curMin) { setErrors((e) => ({ ...e, rotateMax: `Max ต้องมากกว่า Min Rotate (${curMin}°)` })); return; }
-    setErrors((e) => ({ ...e, rotateMax: "" }));
-    updateConfig({ degreeLimit: { min: curMin, max: val } });
   };
 
   const filteredAlertLogs =
@@ -990,7 +994,9 @@ function App() {
                     <button onClick={() => moveStatic("right")} style={s.btnArrow}>➡️</button>
                   </div>
                   <input type="range" min="0" max="180" value={currentAngle}
-                    onChange={(e) => { const v = Number(e.target.value); setCurrentAngle(v); updateConfig({ currentStaticAngle: v }); }}
+                    onChange={(e) => { setCurrentAngle(Number(e.target.value)); }}
+                    onMouseUp={(e) => { updateConfig({ currentStaticAngle: Number(e.target.value) }); }}
+                    onTouchEnd={(e) => { updateConfig({ currentStaticAngle: Number(e.target.value) }); }}
                     style={{ width: "100%", marginTop: "10px", accentColor: "#0f0" }} />
                 </div>
               )}
@@ -1000,40 +1006,26 @@ function App() {
                   <h4 style={{ margin: "0 0 8px 0" }}>Rotation LIMIT (SCAN RANGE 0–180°)</h4>
                   <div style={{ display: "flex", gap: "20px", marginBottom: "4px" }}>
                     <div><div style={{ marginBottom: "4px", fontSize: "12px", color: "#888" }}>Min</div>
-                      <input type="number" min="0" max="180" value={draft.degreeMin} onChange={(e) => handleDegreeMin(e.target.value)} style={errors.degreeMin ? s.inputErr : s.input} /></div>
+                      <input type="number" min="0" max="180" value={draft.degreeMin} onChange={(e) => handleDegreeMin(e.target.value)} onBlur={(e) => commitDegreeMin(e.target.value)} style={errors.degreeMin ? s.inputErr : s.input} /></div>
                     <div><div style={{ marginBottom: "4px", fontSize: "12px", color: "#888" }}>Max</div>
-                      <input type="number" min="0" max="180" value={draft.degreeMax} onChange={(e) => handleDegreeMax(e.target.value)} style={errors.degreeMax ? s.inputErr : s.input} /></div>
+                      <input type="number" min="0" max="180" value={draft.degreeMax} onChange={(e) => handleDegreeMax(e.target.value)} onBlur={(e) => commitDegreeMax(e.target.value)} style={errors.degreeMax ? s.inputErr : s.input} /></div>
                   </div>
                   <ErrMsg msg={errors.degreeMin} /><ErrMsg msg={errors.degreeMax} />
                   <div style={{ marginBottom: "15px" }} />
                 </>
               )}
 
-              {config.mode !== "STATIC" && (
-                <>
-                  <h4 style={{ margin: "0 0 8px 0" }}>ROTATE RANGE (0–180°)</h4>
-                  <div style={{ display: "flex", gap: "20px", marginBottom: "4px" }}>
-                    <div><div style={{ marginBottom: "4px", fontSize: "12px", color: "#888" }}>Min Rotate</div>
-                      <input type="number" min="0" max="180" value={draft.rotateMin} onChange={(e) => handleRotateMin(e.target.value)} style={errors.rotateMin ? s.inputErr : s.input} /></div>
-                    <div><div style={{ marginBottom: "4px", fontSize: "12px", color: "#888" }}>Max Rotate</div>
-                      <input type="number" min="0" max="180" value={draft.rotateMax} onChange={(e) => handleRotateMax(e.target.value)} style={errors.rotateMax ? s.inputErr : s.input} /></div>
-                  </div>
-                  <ErrMsg msg={errors.rotateMin} /><ErrMsg msg={errors.rotateMax} />
-                  <div style={{ marginBottom: "15px" }} />
-                </>
-              )}
-
               <h4 style={{ margin: "0 0 8px 0" }}>MAX DETECT (RANGE)</h4>
               <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
-                <input type="number" min="1" max="500" value={draft.maxDetect} onChange={(e) => handleMaxDetect(e.target.value)} style={errors.maxDetect ? s.inputErr : s.input} />
-                <span style={{ fontSize: "12px", color: "#555" }}>cm &nbsp;(1 – 500)</span>
+                <input type="number" min="1" max="400" value={draft.maxDetect} onChange={(e) => handleMaxDetect(e.target.value)} onBlur={(e) => commitMaxDetect(e.target.value)} style={errors.maxDetect ? s.inputErr : s.input} />
+                <span style={{ fontSize: "12px", color: "#555" }}>cm &nbsp;(1 – 400)</span>
               </div>
               <ErrMsg msg={errors.maxDetect} />
               <div style={{ marginBottom: "15px" }} />
 
               <h4 style={{ margin: "0 0 8px 0", color: "#ff4444" }}>⚠ RED ZONE (ALERT THRESHOLD)</h4>
               <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
-                <input type="number" min="1" max="500" value={draft.redZone} onChange={(e) => handleRedZone(e.target.value)} style={errors.redZone ? s.inputErr : s.inputRed} />
+                <input type="number" min="1" max="400" value={draft.redZone} onChange={(e) => handleRedZone(e.target.value)} onBlur={(e) => commitRedZone(e.target.value)} style={errors.redZone ? s.inputErr : s.inputRed} />
                 <span style={{ fontSize: "12px", color: "#883333" }}>cm &nbsp;(≤ Max Detect)</span>
               </div>
               <ErrMsg msg={errors.redZone} />
